@@ -86,7 +86,9 @@ async function fetchSafe(
 export async function getJobs(params?: Record<string, string>) {
   const maxItems = params?.maxItems ? parseInt(params.maxItems) : 200;
   const { maxItems: _, ...rest } = params || {};
-  return fetchAllPages("/jobs", rest, maxItems);
+  // Default to newest-first so active/open jobs appear before old Cancelled/Closed ones
+  const withDefaults = { sortOrder: "Descending", ...rest };
+  return fetchAllPages("/jobs", withDefaults, maxItems);
 }
 
 export async function searchJobs(body: Record<string, unknown>) {
@@ -137,6 +139,14 @@ export async function getJobInvoices(jobId: string) {
 
 export async function getJobRepresentatives(jobId: string) {
   return fetchApi<any>(`/jobs/${jobId}/representatives`);
+}
+
+export async function getJobSalesOwner(jobId: string) {
+  return fetchApi<any>(`/jobs/${jobId}/representatives/sales-owner`);
+}
+
+export async function getJobCurrentMilestoneWithStatus(jobId: string) {
+  return fetchApi<any>(`/jobs/${jobId}/milestones/current?includes=status`);
 }
 
 export async function getJobHistory(jobId: string) {

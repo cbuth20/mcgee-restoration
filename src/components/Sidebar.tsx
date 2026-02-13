@@ -14,6 +14,7 @@ import {
   ChevronRight,
   Building2,
   Wrench,
+  Target,
 } from "lucide-react";
 import { useState } from "react";
 
@@ -25,6 +26,7 @@ const navItems = [
   { href: "/users", label: "Team", icon: Users },
   { href: "/reports", label: "Reports", icon: FileBarChart },
   { href: "/builder", label: "Report Builder", icon: Wrench },
+  { href: "/sales-cycle", label: "Sales Cycle", icon: Target },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
