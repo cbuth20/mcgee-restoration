@@ -4,6 +4,7 @@ import {
   getJobRepresentatives,
   getJobFinancials,
   getFinancialById,
+  getJobInvoices,
   getUsers,
 } from "./api";
 
@@ -17,7 +18,7 @@ export type StageName =
   | "Completed Design Meeting"
   | "Approved";
 
-export type MilestoneCategory = "LEAD" | "PROSPECT" | "APPROVED";
+export type MilestoneCategory = "LEAD" | "PROSPECT" | "APPROVED" | "COMPLETED" | "INVOICED" | "CLOSED";
 
 export interface StageDefinition {
   name: StageName;
@@ -35,6 +36,25 @@ export const STAGES: StageDefinition[] = [
   { name: "Approved", milestone: "APPROVED", statusMatch: null, order: 6 },
 ];
 
+// ── Inactive Reps ────────────────────────────────────────────────
+export const INACTIVE_REPS = new Set([
+  "ajtaft",
+  "ashton mcgee",
+  "austinhagenyoung",
+  "codygiguere",
+  "davealexander",
+  "geoffmiller",
+  "kyledonlea",
+  "michaelstanford",
+  "pedroceballos",
+  "samwanous",
+]);
+
+export function isActiveRep(name: string): boolean {
+  if (!name) return false;
+  return !INACTIVE_REPS.has(name.toLowerCase().trim());
+}
+
 // ── Types ──────────────────────────────────────────────────────────
 
 export interface EnrichedJob {
@@ -43,6 +63,8 @@ export interface EnrichedJob {
   jobNumber: string;
   currentMilestone: string;
   createdDate: string;
+  milestoneDate: string;   // date job entered its current milestone
+  invoiceDate: string;     // earliest invoice date (for Built YTD)
   stage: StageName | "Unclassified";
   milestoneCategory: MilestoneCategory | "UNKNOWN";
   statusName: string;
@@ -80,6 +102,7 @@ export type LoadingPhase =
   | "enriching-status"
   | "enriching-sales-owner"
   | "enriching-financials"
+  | "enriching-invoices"
   | "complete";
 
 export interface SalesCycleState {
@@ -87,6 +110,10 @@ export interface SalesCycleState {
   funnel: FunnelRow[];
   conversions: ConversionRate[];
   repPerformance: RepPerformance[];
+  salesYTD: number;
+  builtYTD: number;
+  repFunnel: { rep: string; funnel: FunnelRow[] }[];
+  repConversions: { rep: string; conversions: ConversionRate[] }[];
   phase: LoadingPhase;
   phaseMessage: string;
   progress: number; // 0-100
@@ -100,8 +127,20 @@ function getMilestoneCategory(milestone: string): MilestoneCategory | "UNKNOWN" 
   if (upper === "LEAD") return "LEAD";
   if (upper === "PROSPECT") return "PROSPECT";
   if (upper === "APPROVED") return "APPROVED";
+  if (upper === "COMPLETED") return "COMPLETED";
+  if (upper === "INVOICED") return "INVOICED";
+  if (upper === "CLOSED") return "CLOSED";
   return "UNKNOWN";
 }
+
+function isCurrentYear(dateStr: string): boolean {
+  if (!dateStr) return false;
+  const date = new Date(dateStr);
+  return date.getFullYear() === new Date().getFullYear();
+}
+
+/** Milestones considered "post-approved" (job was built/invoiced) */
+const POST_APPROVED_CATEGORIES: MilestoneCategory[] = ["APPROVED", "COMPLETED", "INVOICED"];
 
 function extractStatusName(result: any): string {
   return result?.status?.name || result?.statusName || result?.name || "";
@@ -117,14 +156,6 @@ function classifyJob(milestone: MilestoneCategory | "UNKNOWN", statusName: strin
         return stage.name;
       }
     }
-  }
-
-  // Fallback: when status is just the milestone name (e.g. "Lead", "Prospect"),
-  // classify into the first stage for that milestone
-  const statusLower = statusName.toLowerCase();
-  if (statusLower === milestone.toLowerCase()) {
-    const firstStage = STAGES.find((s) => s.milestone === milestone);
-    if (firstStage) return firstStage.name;
   }
 
   return "Unclassified";
@@ -207,6 +238,76 @@ export function buildConversions(jobs: EnrichedJob[]): ConversionRate[] {
   return conversions;
 }
 
+export function buildRepFunnel(jobs: EnrichedJob[]): { rep: string; funnel: FunnelRow[] }[] {
+  const activeJobs = jobs.filter((j) => isActiveRep(j.salesOwner));
+  const byRep = new Map<string, EnrichedJob[]>();
+  for (const job of activeJobs) {
+    if (!job.salesOwner) continue;
+    const list = byRep.get(job.salesOwner) || [];
+    list.push(job);
+    byRep.set(job.salesOwner, list);
+  }
+
+  return Array.from(byRep.entries())
+    .map(([rep, repJobs]) => ({ rep, funnel: buildFunnel(repJobs) }))
+    .sort((a, b) => a.rep.localeCompare(b.rep));
+}
+
+export function buildRepConversions(jobs: EnrichedJob[]): { rep: string; conversions: ConversionRate[] }[] {
+  const activeJobs = jobs.filter((j) => isActiveRep(j.salesOwner));
+  const byRep = new Map<string, EnrichedJob[]>();
+  for (const job of activeJobs) {
+    if (!job.salesOwner) continue;
+    const list = byRep.get(job.salesOwner) || [];
+    list.push(job);
+    byRep.set(job.salesOwner, list);
+  }
+
+  return Array.from(byRep.entries())
+    .map(([rep, repJobs]) => {
+      // Use all classified jobs (not just current month) for per-rep conversions
+      const classified = repJobs.filter((j) => j.stage !== "Unclassified");
+      const total = classified.length;
+      if (total === 0) return { rep, conversions: [] };
+
+      function countAtOrPast(order: number): number {
+        return classified.filter((j) => {
+          const stageDef = STAGES.find((s) => s.name === j.stage);
+          return stageDef && stageDef.order >= order;
+        }).length;
+      }
+
+      const pairs: [string, string, number, number][] = [
+        ["IVS", "Adjuster", 1, 2],
+        ["Adjuster", "Bought", 2, 3],
+        ["Bought", "Design Completed", 3, 5],
+        ["Design Completed", "Approved", 5, 6],
+      ];
+
+      const conversions: ConversionRate[] = pairs.map(([from, to, fromOrder, toOrder]) => {
+        const fromCount = countAtOrPast(fromOrder);
+        const toCount = countAtOrPast(toOrder);
+        return {
+          from,
+          to,
+          rate: fromCount > 0 ? Math.round((toCount / fromCount) * 100) : 0,
+        };
+      });
+
+      const leadCount = countAtOrPast(1);
+      const approvedCount = countAtOrPast(6);
+      conversions.push({
+        from: "Lead",
+        to: "Approved",
+        rate: leadCount > 0 ? Math.round((approvedCount / leadCount) * 100) : 0,
+      });
+
+      return { rep, conversions };
+    })
+    .filter((r) => r.conversions.length > 0)
+    .sort((a, b) => a.rep.localeCompare(b.rep));
+}
+
 export function buildRepPerformance(jobs: EnrichedJob[]): RepPerformance[] {
   const mtdJobs = jobs.filter((j) => isCurrentMonth(j.createdDate) && j.salesOwner);
 
@@ -250,47 +351,76 @@ export async function loadSalesCycleData(
 ): Promise<void> {
   const jobs: EnrichedJob[] = [];
 
+  const computeYTDs = () => {
+    // Sales YTD = sum of contractAmount for APPROVED jobs where milestoneDate (Approved Date) is in current year
+    const salesYTD = jobs
+      .filter((j) => j.milestoneCategory === "APPROVED" && isCurrentYear(j.milestoneDate))
+      .reduce((s, j) => s + j.contractAmount, 0);
+
+    // Built YTD = sum of contractAmount for jobs with an invoiceDate in current year
+    // Edge case: jobs built last year but invoiced this year count for this year
+    const builtYTD = jobs
+      .filter((j) => j.invoiceDate && isCurrentYear(j.invoiceDate))
+      .reduce((s, j) => s + j.contractAmount, 0);
+
+    return { salesYTD, builtYTD };
+  };
+
   const makeState = (
     phase: LoadingPhase,
     phaseMessage: string,
     progress: number,
     error: string | null = null
-  ): SalesCycleState => ({
-    jobs: [...jobs],
-    funnel: buildFunnel(jobs),
-    conversions: buildConversions(jobs),
-    repPerformance: buildRepPerformance(jobs),
-    phase,
-    phaseMessage,
-    progress,
-    error,
-  });
+  ): SalesCycleState => {
+    const activeJobs = jobs.filter((j) => isActiveRep(j.salesOwner) || !j.salesOwner);
+    const { salesYTD, builtYTD } = computeYTDs();
+    return {
+      jobs: [...jobs],
+      funnel: buildFunnel(activeJobs),
+      conversions: buildConversions(activeJobs),
+      repPerformance: buildRepPerformance(activeJobs),
+      salesYTD,
+      builtYTD,
+      repFunnel: buildRepFunnel(jobs),
+      repConversions: buildRepConversions(jobs),
+      phase,
+      phaseMessage,
+      progress,
+      error,
+    };
+  };
 
   // Phase 1: Fetch jobs
   onUpdate(makeState("fetching-jobs", "Fetching jobs...", 5));
 
   let rawJobs: any[];
   try {
-    // Fetch jobs filtered to the milestones we care about
-    const [leads, prospects, approved] = await Promise.all([
+    // Fetch jobs from all relevant milestones including post-approved
+    // Valid milestones for this company: Lead, Prospect, Approved, Completed, Invoiced, Closed
+    const [leads, prospects, approved, completed, invoiced] = await Promise.all([
       getJobs({ maxItems: "500", milestones: "Lead" }),
       getJobs({ maxItems: "500", milestones: "Prospect" }),
       getJobs({ maxItems: "500", milestones: "Approved" }),
+      getJobs({ maxItems: "500", milestones: "Completed" }),
+      getJobs({ maxItems: "500", milestones: "Invoiced" }),
     ]);
     rawJobs = [
       ...(leads.items || []),
       ...(prospects.items || []),
       ...(approved.items || []),
+      ...(completed.items || []),
+      ...(invoiced.items || []),
     ];
   } catch (err) {
     onUpdate(makeState("complete", "", 0, err instanceof Error ? err.message : "Failed to fetch jobs"));
     return;
   }
 
-  // Build initial enriched list — APPROVED jobs can be classified immediately
+  // Build initial enriched list — APPROVED and post-approved jobs can be classified immediately
   for (const job of rawJobs) {
     const milestoneCategory = getMilestoneCategory(job.currentMilestone);
-    const stage = milestoneCategory === "APPROVED" ? "Approved" as StageName : "Unclassified" as const;
+    const isApprovedOrLater = POST_APPROVED_CATEGORIES.includes(milestoneCategory as MilestoneCategory);
+    const stage = isApprovedOrLater ? "Approved" as StageName : "Unclassified" as const;
 
     jobs.push({
       id: job.id,
@@ -298,6 +428,8 @@ export async function loadSalesCycleData(
       jobNumber: job.jobNumber || "",
       currentMilestone: job.currentMilestone || "",
       createdDate: job.createdDate || "",
+      milestoneDate: job.milestoneDate || "",
+      invoiceDate: "",
       stage,
       milestoneCategory,
       statusName: "",
@@ -308,8 +440,8 @@ export async function loadSalesCycleData(
 
   onUpdate(makeState("fetching-jobs", `Found ${jobs.length} jobs`, 15));
 
-  // Phase 2: Enrich status for non-APPROVED jobs
-  const needsStatus = jobs.filter((j) => j.milestoneCategory !== "APPROVED" && j.milestoneCategory !== "UNKNOWN");
+  // Phase 2: Enrich status for LEAD and PROSPECT jobs only
+  const needsStatus = jobs.filter((j) => j.milestoneCategory === "LEAD" || j.milestoneCategory === "PROSPECT");
 
   if (needsStatus.length > 0) {
     onUpdate(makeState("enriching-status", `Loading status for ${needsStatus.length} jobs...`, 20));
@@ -394,7 +526,7 @@ export async function loadSalesCycleData(
   const needsFinancials = jobs.filter((j) => j.milestoneCategory !== "UNKNOWN");
 
   if (needsFinancials.length > 0) {
-    onUpdate(makeState("enriching-financials", `Loading financials for ${needsFinancials.length} jobs...`, 75));
+    onUpdate(makeState("enriching-financials", `Loading financials for ${needsFinancials.length} jobs...`, 72));
 
     await batchProcess(
       needsFinancials,
@@ -419,8 +551,47 @@ export async function loadSalesCycleData(
       },
       5,
       (done, total) => {
-        const pct = 75 + Math.round((done / total) * 20);
+        const pct = 72 + Math.round((done / total) * 18);
         onUpdate(makeState("enriching-financials", `Financials: ${done}/${total} jobs`, pct));
+      }
+    );
+  }
+
+  onUpdate(makeState("enriching-financials", "Financial enrichment complete", 90));
+
+  // Phase 5: Enrich invoice dates for Built YTD
+  // Fetch earliest invoice date for Completed/Invoiced jobs (and Approved jobs that may have invoices)
+  const needsInvoices = jobs.filter((j) =>
+    j.milestoneCategory === "APPROVED" || j.milestoneCategory === "COMPLETED" || j.milestoneCategory === "INVOICED"
+  );
+
+  if (needsInvoices.length > 0) {
+    onUpdate(makeState("enriching-invoices", `Loading invoice dates for ${needsInvoices.length} jobs...`, 91));
+
+    await batchProcess(
+      needsInvoices,
+      async (job) => {
+        try {
+          const result = await getJobInvoices(job.id);
+          const invoices = result?.items || [];
+          if (invoices.length > 0) {
+            // Find the earliest invoice date
+            const dates = invoices
+              .map((inv: any) => inv.invoiceDate)
+              .filter((d: string) => d && d !== "")
+              .sort();
+            if (dates.length > 0) {
+              job.invoiceDate = dates[0];
+            }
+          }
+        } catch {
+          // Leave invoiceDate empty
+        }
+      },
+      5,
+      (done, total) => {
+        const pct = 91 + Math.round((done / total) * 8);
+        onUpdate(makeState("enriching-invoices", `Invoices: ${done}/${total} jobs`, pct));
       }
     );
   }

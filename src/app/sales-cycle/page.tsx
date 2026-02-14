@@ -17,6 +17,7 @@ import {
   EnrichedJob,
   FunnelRow,
   STAGES,
+  isActiveRep,
 } from "@/lib/salesCycleEngine";
 import { getUsers } from "@/lib/api";
 
@@ -191,45 +192,74 @@ function ConversionCard({
 // ── Helper: compute per-rep milestone counts ─────────────────────
 
 interface RepStageRow {
+  rank: number;
   rep: string;
-  leads: number;
-  prospects: number;
-  approved: number;
-  approvedValue: number;
+  ivsCount: number;
+  adjusterCount: number;
+  boughtCount: number;
+  designScheduledCount: number;
+  designCompletedCount: number;
+  approvedCount: number;
+  salesYTD: number;
   total: number;
+}
+
+function isCurrentYear(dateStr: string): boolean {
+  if (!dateStr) return false;
+  const date = new Date(dateStr);
+  return date.getFullYear() === new Date().getFullYear();
 }
 
 function buildRepStageTable(jobs: EnrichedJob[], salesUserNames: string[]): RepStageRow[] {
   const byRep = new Map<string, EnrichedJob[]>();
 
-  // Seed with all sales users so they appear even with 0 jobs
+  // Seed with active sales users so they appear even with 0 jobs
   for (const name of salesUserNames) {
-    byRep.set(name, []);
+    if (isActiveRep(name)) {
+      byRep.set(name, []);
+    }
   }
 
   for (const job of jobs) {
-    if (!job.salesOwner) continue;
+    if (!job.salesOwner || !isActiveRep(job.salesOwner)) continue;
     const list = byRep.get(job.salesOwner) || [];
     list.push(job);
     byRep.set(job.salesOwner, list);
   }
 
-  return Array.from(byRep.entries())
+  const rows = Array.from(byRep.entries())
     .map(([rep, repJobs]) => {
-      const leads = repJobs.filter((j) => j.milestoneCategory === "LEAD").length;
-      const prospects = repJobs.filter((j) => j.milestoneCategory === "PROSPECT").length;
-      const approvedJobs = repJobs.filter((j) => j.milestoneCategory === "APPROVED");
+      const ivsCount = repJobs.filter((j) => j.stage === "Initial Visit Scheduled").length;
+      const adjusterCount = repJobs.filter((j) => j.stage === "Adjuster Meeting Scheduled").length;
+      const boughtCount = repJobs.filter((j) => j.stage === "Bought Job").length;
+      const designScheduledCount = repJobs.filter((j) => j.stage === "Scheduled Design Meeting").length;
+      const designCompletedCount = repJobs.filter((j) => j.stage === "Completed Design Meeting").length;
+      const approvedCount = repJobs.filter((j) => j.stage === "Approved").length;
+
+      // Sales YTD = sum of contractAmount for approved jobs where milestoneDate (Approved Date) is in current year
+      const salesYTD = repJobs
+        .filter((j) => j.milestoneCategory === "APPROVED" && isCurrentYear(j.milestoneDate))
+        .reduce((s, j) => s + j.contractAmount, 0);
 
       return {
+        rank: 0,
         rep,
-        leads,
-        prospects,
-        approved: approvedJobs.length,
-        approvedValue: approvedJobs.reduce((s, j) => s + j.contractAmount, 0),
-        total: leads + prospects + approvedJobs.length,
+        ivsCount,
+        adjusterCount,
+        boughtCount,
+        designScheduledCount,
+        designCompletedCount,
+        approvedCount,
+        salesYTD,
+        total: ivsCount + adjusterCount + boughtCount + designScheduledCount + designCompletedCount + approvedCount,
       };
     })
-    .sort((a, b) => b.total - a.total || a.rep.localeCompare(b.rep));
+    .sort((a, b) => b.salesYTD - a.salesYTD || a.rep.localeCompare(b.rep));
+
+  // Assign ranks
+  rows.forEach((row, i) => { row.rank = i + 1; });
+
+  return rows;
 }
 
 // ── Main Page ────────────────────────────────────────────────────
@@ -257,7 +287,7 @@ export default function SalesCyclePage() {
             [u.firstName, u.lastName].filter(Boolean).join(" ") ||
             u.name
           )
-          .filter(Boolean);
+          .filter((name: string) => name && isActiveRep(name));
         setSalesUsers(salesNames);
       })
       .catch(() => {
@@ -282,46 +312,10 @@ export default function SalesCyclePage() {
   const funnel = state?.funnel || [];
   const conversions = state?.conversions || [];
 
-  // ── DEBUG: test API endpoints ──
-  useEffect(() => {
-    if (state?.phase !== "complete" || jobs.length === 0) return;
-
-    // Find an APPROVED job to test financials on
-    const approvedJob = jobs.find((j) => j.milestoneCategory === "APPROVED");
-    if (approvedJob) {
-      console.log("=== DEBUG: Testing financials for APPROVED job:", approvedJob.id, approvedJob.jobName, "===");
-
-      // Test: /jobs/{id}/financials
-      fetch(`/api/acculynx?endpoint=${encodeURIComponent(`/jobs/${approvedJob.id}/financials`)}`)
-        .then((r) => r.json())
-        .then((data) => console.log("=== DEBUG: /financials response ===", JSON.stringify(data, null, 2)))
-        .catch((err) => console.error("=== DEBUG: /financials ERROR ===", err));
-
-      // Test: /jobs/{id}/estimates
-      fetch(`/api/acculynx?endpoint=${encodeURIComponent(`/jobs/${approvedJob.id}/estimates`)}`)
-        .then((r) => r.json())
-        .then((data) => console.log("=== DEBUG: /estimates response ===", JSON.stringify(data, null, 2)))
-        .catch((err) => console.error("=== DEBUG: /estimates ERROR ===", err));
-
-      // Test: /jobs/{id} (full job object)
-      fetch(`/api/acculynx?endpoint=${encodeURIComponent(`/jobs/${approvedJob.id}`)}`)
-        .then((r) => r.json())
-        .then((data) => console.log("=== DEBUG: /jobs/{id} full ===", JSON.stringify(data, null, 2)))
-        .catch((err) => console.error("=== DEBUG: /jobs/{id} ERROR ===", err));
-    }
-
-    // Summary: salesOwner + contractAmount stats
-    const jobOwners = [...new Set(jobs.filter((j) => j.salesOwner).map((j) => j.salesOwner))].sort();
-    const withAmount = jobs.filter((j) => j.contractAmount > 0);
-    console.log("=== DEBUG: salesOwner populated on", jobOwners.length, "of", jobs.length, "jobs ===", jobOwners);
-    console.log("=== DEBUG: contractAmount > 0 on", withAmount.length, "jobs. Sample:", withAmount.slice(0, 5).map((j) => ({ name: j.jobName, amount: j.contractAmount, milestone: j.milestoneCategory })));
-  }, [state?.phase, jobs]);
-  // ── END DEBUG ──
-
-  // YTD goal calculations
+  // YTD goal calculations from engine state
   const prospectCount = jobs.filter((j) => j.milestoneCategory === "PROSPECT").length;
-  const approvedJobs = jobs.filter((j) => j.milestoneCategory === "APPROVED");
-  const approvedTotal = approvedJobs.reduce((s, j) => s + j.contractAmount, 0);
+  const salesYTD = state?.salesYTD || 0;
+  const builtYTD = state?.builtYTD || 0;
 
   // Rep stage table
   const repStageData = useMemo(
@@ -333,6 +327,14 @@ export default function SalesCyclePage() {
 
   const repColumns = [
     {
+      key: "rank",
+      label: "#",
+      sortable: true,
+      render: (item: RepStageRow) => (
+        <span className="font-semibold text-gray-500">{item.rank}</span>
+      ),
+    },
+    {
       key: "rep",
       label: "Rep",
       sortable: true,
@@ -340,16 +342,19 @@ export default function SalesCyclePage() {
         <span className="font-medium text-gray-900">{item.rep}</span>
       ),
     },
-    { key: "leads", label: "Leads", sortable: true },
-    { key: "prospects", label: "Prospects", sortable: true },
-    { key: "approved", label: "Approved", sortable: true },
+    { key: "ivsCount", label: "IVS", sortable: true },
+    { key: "adjusterCount", label: "Adjuster", sortable: true },
+    { key: "boughtCount", label: "Bought", sortable: true },
+    { key: "designScheduledCount", label: "Design Sched", sortable: true },
+    { key: "designCompletedCount", label: "Design Comp", sortable: true },
+    { key: "approvedCount", label: "Approved", sortable: true },
     {
-      key: "approvedValue",
-      label: "$ Approved",
+      key: "salesYTD",
+      label: "Sales YTD",
       sortable: true,
       render: (item: RepStageRow) => (
         <span className="font-medium">
-          {item.approvedValue > 0 ? fmt(item.approvedValue) : "—"}
+          {item.salesYTD > 0 ? fmt(item.salesYTD) : "—"}
         </span>
       ),
     },
@@ -456,7 +461,7 @@ export default function SalesCyclePage() {
                 />
                 <GoalCard
                   label="Sales YTD"
-                  actual={approvedTotal}
+                  actual={salesYTD}
                   target={30_000_000}
                   format="currency"
                   icon={DollarSign}
@@ -465,7 +470,7 @@ export default function SalesCyclePage() {
                 />
                 <GoalCard
                   label="Built YTD"
-                  actual={approvedTotal}
+                  actual={builtYTD}
                   target={27_500_000}
                   format="currency"
                   icon={Hammer}
@@ -518,6 +523,52 @@ export default function SalesCyclePage() {
               ))}
             </div>
           </Card>
+
+          {/* Per-Rep Funnel */}
+          {(state?.repFunnel || []).length > 0 && (
+            <div className="mt-8">
+              <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-gray-500">
+                Funnel Per Sales Rep
+              </h2>
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                {(state?.repFunnel || []).map(({ rep, funnel: repF }) => {
+                  const repMax = Math.max(...repF.map((r) => r.count), 1);
+                  const hasJobs = repF.some((r) => r.count > 0);
+                  if (!hasJobs) return null;
+                  return (
+                    <Card key={rep} title={rep} subtitle="Individual funnel">
+                      <div className="divide-y divide-gray-100">
+                        {repF.map((row) => (
+                          <FunnelBar key={row.stage} row={row} maxCount={repMax} />
+                        ))}
+                      </div>
+                    </Card>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Per-Rep Conversion Rates */}
+          {(state?.repConversions || []).length > 0 && (
+            <div className="mt-8">
+              <h2 className="mb-4 text-sm font-semibold uppercase tracking-wider text-gray-500">
+                Conversion Rates Per Rep
+              </h2>
+              <div className="space-y-6">
+                {(state?.repConversions || []).map(({ rep, conversions: repConv }) => (
+                  <div key={rep}>
+                    <h3 className="mb-3 text-sm font-semibold text-gray-700">{rep}</h3>
+                    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                      {repConv.map((c) => (
+                        <ConversionCard key={`${rep}-${c.from}-${c.to}`} from={c.from} to={c.to} rate={c.rate} />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </>
       )}
 
