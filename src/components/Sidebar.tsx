@@ -26,7 +26,7 @@ const navItems = [
   { href: "/users", label: "Team", icon: Users },
   { href: "/reports", label: "Reports", icon: FileBarChart },
   { href: "/builder", label: "Report Builder", icon: Wrench },
-  { href: "/sales-cycle", label: "Sales Cycle", icon: Target },
+  { href: "/sales-cycle", label: "Sales Dashboard", icon: Target },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

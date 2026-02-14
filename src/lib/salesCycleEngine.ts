@@ -1,8 +1,10 @@
 import {
   getJobs,
   getJobCurrentMilestoneWithStatus,
-  getJobSalesOwner,
+  getJobRepresentatives,
   getJobFinancials,
+  getFinancialById,
+  getUsers,
 } from "./api";
 
 // ── Stage Definitions ──────────────────────────────────────────────
@@ -108,6 +110,7 @@ function extractStatusName(result: any): string {
 function classifyJob(milestone: MilestoneCategory | "UNKNOWN", statusName: string): StageName | "Unclassified" {
   if (milestone === "APPROVED") return "Approved";
 
+  // Try exact status match first
   for (const stage of STAGES) {
     if (stage.milestone === milestone && stage.statusMatch) {
       if (statusName.toLowerCase() === stage.statusMatch.toLowerCase()) {
@@ -115,6 +118,15 @@ function classifyJob(milestone: MilestoneCategory | "UNKNOWN", statusName: strin
       }
     }
   }
+
+  // Fallback: when status is just the milestone name (e.g. "Lead", "Prospect"),
+  // classify into the first stage for that milestone
+  const statusLower = statusName.toLowerCase();
+  if (statusLower === milestone.toLowerCase()) {
+    const firstStage = STAGES.find((s) => s.milestone === milestone);
+    if (firstStage) return firstStage.name;
+  }
+
   return "Unclassified";
 }
 
@@ -324,20 +336,45 @@ export async function loadSalesCycleData(
 
   onUpdate(makeState("enriching-status", "Status enrichment complete", 45));
 
-  // Phase 3: Enrich sales owner
-  const needsOwner = jobs.filter((j) => j.stage !== "Unclassified");
+  // Phase 3: Enrich sales owner for all jobs with a known milestone
+  const needsOwner = jobs.filter((j) => j.milestoneCategory !== "UNKNOWN");
 
   if (needsOwner.length > 0) {
-    onUpdate(makeState("enriching-sales-owner", `Loading sales owners for ${needsOwner.length} jobs...`, 50));
+    onUpdate(makeState("enriching-sales-owner", "Loading user directory...", 50));
+
+    // Build a user ID → display name lookup from all users
+    const userNameMap = new Map<string, string>();
+    try {
+      const usersResult = await getUsers();
+      const userList = usersResult?.items || usersResult || [];
+      for (const u of userList) {
+        const name =
+          u.displayName ||
+          [u.firstName, u.lastName].filter(Boolean).join(" ") ||
+          u.name || "";
+        if (u.id && name) {
+          userNameMap.set(u.id, name);
+        }
+      }
+    } catch {
+      // Continue without user lookup — salesOwner will stay empty
+    }
+
+    onUpdate(makeState("enriching-sales-owner", `Matching reps for ${needsOwner.length} jobs...`, 55));
 
     await batchProcess(
       needsOwner,
       async (job) => {
         try {
-          const result = await getJobSalesOwner(job.id);
-          if (result) {
-            job.salesOwner = result.name || result.displayName ||
-              [result.firstName, result.lastName].filter(Boolean).join(" ") || "";
+          const result = await getJobRepresentatives(job.id);
+          const reps = result?.items || [];
+          // Prefer SalesOwner type, fallback to CompanyRepresentative, then first rep
+          const rep =
+            reps.find((r: any) => r.type === "SalesOwner") ||
+            reps.find((r: any) => r.type === "CompanyRepresentative") ||
+            reps[0];
+          if (rep?.user?.id) {
+            job.salesOwner = userNameMap.get(rep.user.id) || "";
           }
         } catch {
           // Leave empty
@@ -345,7 +382,7 @@ export async function loadSalesCycleData(
       },
       5,
       (done, total) => {
-        const pct = 50 + Math.round((done / total) * 20);
+        const pct = 55 + Math.round((done / total) * 15);
         onUpdate(makeState("enriching-sales-owner", `Sales owners: ${done}/${total} jobs`, pct));
       }
     );
@@ -354,7 +391,7 @@ export async function loadSalesCycleData(
   onUpdate(makeState("enriching-sales-owner", "Sales owner enrichment complete", 70));
 
   // Phase 4: Enrich financials
-  const needsFinancials = jobs.filter((j) => j.stage !== "Unclassified");
+  const needsFinancials = jobs.filter((j) => j.milestoneCategory !== "UNKNOWN");
 
   if (needsFinancials.length > 0) {
     onUpdate(makeState("enriching-financials", `Loading financials for ${needsFinancials.length} jobs...`, 75));
@@ -365,7 +402,16 @@ export async function loadSalesCycleData(
         try {
           const result = await getJobFinancials(job.id);
           if (result) {
-            job.contractAmount = result.contractAmount || result.totalContractAmount || result.estimateTotal || 0;
+            // If the response has approvedJobValue directly, use it
+            if (result.approvedJobValue != null) {
+              job.contractAmount = result.approvedJobValue;
+            } else if (result.id) {
+              // /jobs/{id}/financials returned a link — resolve via /financials/{id}
+              const full = await getFinancialById(result.id);
+              if (full?.approvedJobValue != null) {
+                job.contractAmount = full.approvedJobValue;
+              }
+            }
           }
         } catch {
           // Leave as 0
