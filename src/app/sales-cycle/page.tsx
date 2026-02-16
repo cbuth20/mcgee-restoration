@@ -229,12 +229,16 @@ function buildRepStageTable(jobs: EnrichedJob[], salesUserNames: string[]): RepS
 
   const rows = Array.from(byRep.entries())
     .map(([rep, repJobs]) => {
-      const ivsCount = repJobs.filter((j) => j.stage === "Initial Visit Scheduled").length;
-      const adjusterCount = repJobs.filter((j) => j.stage === "Adjuster Meeting Scheduled").length;
-      const boughtCount = repJobs.filter((j) => j.stage === "Bought Job").length;
-      const designScheduledCount = repJobs.filter((j) => j.stage === "Scheduled Design Meeting").length;
-      const designCompletedCount = repJobs.filter((j) => j.stage === "Completed Design Meeting").length;
-      const approvedCount = repJobs.filter((j) => j.stage === "Approved").length;
+      // Pipeline stages: only count jobs created this year (YTD view)
+      const ytdPipelineJobs = repJobs.filter((j) => isCurrentYear(j.createdDate));
+      const ivsCount = ytdPipelineJobs.filter((j) => j.stage === "Initial Visit Scheduled").length;
+      const adjusterCount = ytdPipelineJobs.filter((j) => j.stage === "Adjuster Meeting Scheduled").length;
+      const boughtCount = ytdPipelineJobs.filter((j) => j.stage === "Bought Job").length;
+      const designScheduledCount = ytdPipelineJobs.filter((j) => j.stage === "Scheduled Design Meeting").length;
+      const designCompletedCount = ytdPipelineJobs.filter((j) => j.stage === "Completed Design Meeting").length;
+
+      // Approved: count jobs approved this year (milestoneDate in current year), matching Sales YTD
+      const approvedCount = repJobs.filter((j) => j.milestoneCategory === "APPROVED" && isCurrentYear(j.milestoneDate)).length;
 
       // Sales YTD = sum of contractAmount for approved jobs where milestoneDate (Approved Date) is in current year
       const salesYTD = repJobs
@@ -254,12 +258,58 @@ function buildRepStageTable(jobs: EnrichedJob[], salesUserNames: string[]): RepS
         total: ivsCount + adjusterCount + boughtCount + designScheduledCount + designCompletedCount + approvedCount,
       };
     })
+    .filter((row) => row.salesYTD > 0)
     .sort((a, b) => b.salesYTD - a.salesYTD || a.rep.localeCompare(b.rep));
 
   // Assign ranks
   rows.forEach((row, i) => { row.rank = i + 1; });
 
   return rows;
+}
+
+// ── Rep Stage CSV Override ────────────────────────────────────────
+
+const REP_STAGE_CSV_KEY = "rep-stage-csv-data";
+
+function readRepStageCSV(): RepStageRow[] | null {
+  try {
+    const raw = localStorage.getItem(REP_STAGE_CSV_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw) as { rows: RepStageRow[] };
+    if (data.rows && data.rows.length > 0) return data.rows;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Cache Helpers ────────────────────────────────────────────────
+
+const CACHE_KEY = "sales-dashboard-cache";
+
+interface CachedData {
+  state: SalesCycleState;
+  salesUsers: string[];
+  cachedAt: string;
+}
+
+function readCache(): CachedData | null {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as CachedData;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(state: SalesCycleState, salesUsers: string[]): void {
+  try {
+    const data: CachedData = { state, salesUsers, cachedAt: new Date().toISOString() };
+    localStorage.setItem(CACHE_KEY, JSON.stringify(data));
+  } catch {
+    // localStorage full or unavailable — ignore
+  }
 }
 
 // ── Main Page ────────────────────────────────────────────────────
@@ -270,10 +320,22 @@ export default function SalesCyclePage() {
   const [loading, setLoading] = useState(false);
   const [salesUsers, setSalesUsers] = useState<string[]>([]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceRefresh = false) => {
+    // Try cache first (unless forcing refresh)
+    if (!forceRefresh) {
+      const cached = readCache();
+      if (cached) {
+        setState(cached.state);
+        setSalesUsers(cached.salesUsers);
+        setLoading(false);
+        return;
+      }
+    }
+
     setLoading(true);
 
     // Fetch sales users in parallel with job data
+    let resolvedSalesUsers: string[] = [];
     const usersPromise = getUsers()
       .then((res: any) => {
         const users = res.items || res || [];
@@ -288,6 +350,7 @@ export default function SalesCyclePage() {
             u.name
           )
           .filter((name: string) => name && isActiveRep(name));
+        resolvedSalesUsers = salesNames;
         setSalesUsers(salesNames);
       })
       .catch(() => {
@@ -298,6 +361,7 @@ export default function SalesCyclePage() {
       setState(newState);
       if (newState.phase === "complete") {
         setLoading(false);
+        writeCache(newState, resolvedSalesUsers);
       }
     });
 
@@ -317,11 +381,12 @@ export default function SalesCyclePage() {
   const salesYTD = state?.salesYTD || 0;
   const builtYTD = state?.builtYTD || 0;
 
-  // Rep stage table
-  const repStageData = useMemo(
-    () => buildRepStageTable(jobs, salesUsers),
-    [jobs, salesUsers]
-  );
+  // Rep stage table — prefer CSV upload if present
+  const repStageData = useMemo(() => {
+    const uploaded = readRepStageCSV();
+    if (uploaded) return uploaded;
+    return buildRepStageTable(jobs, salesUsers);
+  }, [jobs, salesUsers]);
 
   const maxFunnelCount = Math.max(...funnel.map((r) => r.count), 1);
 
@@ -375,7 +440,7 @@ export default function SalesCyclePage() {
         subtitle="AMRG year-to-date sales performance"
         actions={
           <button
-            onClick={load}
+            onClick={() => load(true)}
             disabled={loading}
             className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-blue-700 disabled:opacity-50"
           >

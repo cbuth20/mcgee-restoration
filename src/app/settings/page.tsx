@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect, useRef } from "react";
 import { useApi } from "@/lib/hooks";
 import {
   getCompanySettings,
@@ -12,7 +13,64 @@ import {
 import PageHeader from "@/components/PageHeader";
 import Card from "@/components/Card";
 import LoadingSpinner from "@/components/LoadingSpinner";
-import { CheckCircle2, XCircle, RefreshCw } from "lucide-react";
+import { CheckCircle2, XCircle, RefreshCw, Upload, Trash2 } from "lucide-react";
+
+interface RepStageRow {
+  rank: number;
+  rep: string;
+  ivsCount: number;
+  adjusterCount: number;
+  boughtCount: number;
+  designScheduledCount: number;
+  designCompletedCount: number;
+  approvedCount: number;
+  salesYTD: number;
+  total: number;
+}
+
+interface RepStageCSVData {
+  rows: RepStageRow[];
+  uploadedAt: string;
+  fileName: string;
+}
+
+const REP_STAGE_CSV_KEY = "rep-stage-csv-data";
+
+function parseRepStageCSV(text: string): RepStageRow[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length < 2) return [];
+
+  // Skip header row
+  const dataLines = lines.slice(1);
+  const rows: RepStageRow[] = dataLines.map((line) => {
+    const cols = line.split(",").map((c) => c.trim());
+    const ivsCount = parseFloat(cols[1]) || 0;
+    const adjusterCount = parseFloat(cols[2]) || 0;
+    const boughtCount = parseFloat(cols[3]) || 0;
+    const designScheduledCount = parseFloat(cols[4]) || 0;
+    const designCompletedCount = parseFloat(cols[5]) || 0;
+    const approvedCount = parseFloat(cols[6]) || 0;
+    const salesYTD = parseFloat(cols[7]) || 0;
+    return {
+      rank: 0,
+      rep: cols[0] || "",
+      ivsCount,
+      adjusterCount,
+      boughtCount,
+      designScheduledCount,
+      designCompletedCount,
+      approvedCount,
+      salesYTD,
+      total: ivsCount + adjusterCount + boughtCount + designScheduledCount + designCompletedCount + approvedCount,
+    };
+  }).filter((r) => r.rep);
+
+  // Rank by Sales YTD descending
+  rows.sort((a, b) => b.salesYTD - a.salesYTD || a.rep.localeCompare(b.rep));
+  rows.forEach((r, i) => { r.rank = i + 1; });
+
+  return rows;
+}
 
 export default function SettingsPage() {
   const { data: pingData, loading: pingLoading, error: pingError, refetch: refetchPing } = useApi(
@@ -39,6 +97,43 @@ export default function SettingsPage() {
     () => getJobCategories(),
     []
   );
+
+  // CSV upload state
+  const [csvData, setCsvData] = useState<RepStageCSVData | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(REP_STAGE_CSV_KEY);
+      if (raw) setCsvData(JSON.parse(raw));
+    } catch { /* ignore */ }
+  }, []);
+
+  const handleCSVUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const text = evt.target?.result as string;
+      const rows = parseRepStageCSV(text);
+      if (rows.length === 0) return;
+      const data: RepStageCSVData = {
+        rows,
+        uploadedAt: new Date().toISOString(),
+        fileName: file.name,
+      };
+      localStorage.setItem(REP_STAGE_CSV_KEY, JSON.stringify(data));
+      setCsvData(data);
+    };
+    reader.readAsText(file);
+    // Reset input so the same file can be re-uploaded
+    e.target.value = "";
+  };
+
+  const clearCSV = () => {
+    localStorage.removeItem(REP_STAGE_CSV_KEY);
+    setCsvData(null);
+  };
 
   const isLoading = companyLoading || lsLoading || ttLoading || wtLoading || jcLoading;
 
@@ -82,6 +177,54 @@ export default function SettingsPage() {
             Test
           </button>
         </div>
+      </Card>
+
+      {/* CSV Upload for Rep Stage Data */}
+      <Card title="Rep Stage Data Upload" subtitle="Upload a CSV to override the Sales Rep Performance table" className="mb-6">
+        {csvData ? (
+          <div className="space-y-3">
+            <div className="flex items-center gap-3">
+              <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+              <div>
+                <p className="text-sm font-medium text-gray-900">CSV Loaded</p>
+                <p className="text-xs text-gray-500">
+                  {csvData.rows.length} rep{csvData.rows.length !== 1 ? "s" : ""} from{" "}
+                  <span className="font-medium">{csvData.fileName}</span>
+                  {" "}— uploaded {new Date(csvData.uploadedAt).toLocaleString()}
+                </p>
+              </div>
+              <button
+                onClick={clearCSV}
+                className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+              >
+                <Trash2 className="h-3 w-3" />
+                Clear
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-sm text-gray-500">
+              Expected columns: <span className="font-medium">Rep, IVS, Adjuster, Bought, Design Sched, Design Comp, Approved, Sales YTD</span>
+            </p>
+            <div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv"
+                onChange={handleCSVUpload}
+                className="hidden"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center gap-2 rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                <Upload className="h-4 w-4" />
+                Choose CSV File
+              </button>
+            </div>
+          </div>
+        )}
       </Card>
 
       {isLoading && <LoadingSpinner message="Loading configuration..." />}

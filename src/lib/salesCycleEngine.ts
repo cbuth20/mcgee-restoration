@@ -70,6 +70,7 @@ export interface EnrichedJob {
   statusName: string;
   salesOwner: string;
   contractAmount: number;
+  builtAmount: number;
 }
 
 export interface FunnelRow {
@@ -357,11 +358,10 @@ export async function loadSalesCycleData(
       .filter((j) => j.milestoneCategory === "APPROVED" && isCurrentYear(j.milestoneDate))
       .reduce((s, j) => s + j.contractAmount, 0);
 
-    // Built YTD = sum of contractAmount for jobs with an invoiceDate in current year
-    // Edge case: jobs built last year but invoiced this year count for this year
+    // Built YTD = sum of actual invoice amounts for current-year invoices
     const builtYTD = jobs
-      .filter((j) => j.invoiceDate && isCurrentYear(j.invoiceDate))
-      .reduce((s, j) => s + j.contractAmount, 0);
+      .filter((j) => j.builtAmount > 0)
+      .reduce((s, j) => s + j.builtAmount, 0);
 
     return { salesYTD, builtYTD };
   };
@@ -419,8 +419,7 @@ export async function loadSalesCycleData(
   // Build initial enriched list — APPROVED and post-approved jobs can be classified immediately
   for (const job of rawJobs) {
     const milestoneCategory = getMilestoneCategory(job.currentMilestone);
-    const isApprovedOrLater = POST_APPROVED_CATEGORIES.includes(milestoneCategory as MilestoneCategory);
-    const stage = isApprovedOrLater ? "Approved" as StageName : "Unclassified" as const;
+    const stage = (milestoneCategory === "APPROVED") ? "Approved" as StageName : "Unclassified" as const;
 
     jobs.push({
       id: job.id,
@@ -435,6 +434,7 @@ export async function loadSalesCycleData(
       statusName: "",
       salesOwner: "",
       contractAmount: 0,
+      builtAmount: 0,
     });
   }
 
@@ -573,16 +573,27 @@ export async function loadSalesCycleData(
       async (job) => {
         try {
           const result = await getJobInvoices(job.id);
-          const invoices = result?.items || [];
-          if (invoices.length > 0) {
+          const invoices = result?.items || result || [];
+          const invoiceList = Array.isArray(invoices) ? invoices : [];
+          if (invoiceList.length > 0) {
+            // Debug: log first invoice object keys to identify amount field
+            if (jobs.indexOf(job) === needsInvoices.indexOf(job) && needsInvoices.indexOf(job) === 0) {
+              console.log("[Built YTD Debug] Sample invoice object:", JSON.stringify(invoiceList[0]));
+            }
+
             // Find the earliest invoice date
-            const dates = invoices
+            const dates = invoiceList
               .map((inv: any) => inv.invoiceDate)
               .filter((d: string) => d && d !== "")
               .sort();
             if (dates.length > 0) {
               job.invoiceDate = dates[0];
             }
+
+            // Sum invoice amounts for current-year invoices (Built YTD)
+            job.builtAmount = invoiceList
+              .filter((inv: any) => inv.invoiceDate && isCurrentYear(inv.invoiceDate))
+              .reduce((sum: number, inv: any) => sum + (inv.invoiceTotal || inv.amount || inv.total || inv.invoiceAmount || 0), 0);
           }
         } catch {
           // Leave invoiceDate empty
